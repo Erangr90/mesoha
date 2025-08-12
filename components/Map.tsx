@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   View,
   StyleSheet,
@@ -13,7 +13,7 @@ import {
   Platform,
   Image,
 } from 'react-native';
-import Mapbox, { MapView, Camera, UserLocation, MarkerView } from '@rnmapbox/maps';
+import Mapbox, { MapView, Camera, MarkerView, UserLocation } from '@rnmapbox/maps';
 import * as Location from 'expo-location';
 
 const MAPBOX_TOKEN =
@@ -21,7 +21,6 @@ const MAPBOX_TOKEN =
 
 Mapbox.setAccessToken(MAPBOX_TOKEN);
 
-// Events
 const EVENTS = {
   שרפה: '🔥',
   'זריקת אבנים': '🪨',
@@ -33,7 +32,7 @@ const EVENTS = {
 
 type EventType = keyof typeof EVENTS;
 
-interface MarkerItem {
+interface Marker {
   id: string;
   coordinates: [number, number];
   icon: string;
@@ -49,7 +48,7 @@ interface GeoFeature {
 export default function Map() {
   const [location, setLocation] = useState<[number, number] | null>(null);
   const [selectedEvent, setSelectedEvent] = useState<EventType | null>(null);
-  const [markers, setMarkers] = useState<MarkerItem[]>([]);
+  const [markers, setMarkers] = useState<Marker[]>([]);
   const [modalVisible, setModalVisible] = useState(false);
 
   // Search state
@@ -59,21 +58,14 @@ export default function Map() {
   const [openList, setOpenList] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // open-close menu
   const [menuOpen, setMenuOpen] = useState(false);
 
-  // Map ready gate
   const [mapReady, setMapReady] = useState(false);
-  const [didCenter, setDidCenter] = useState(false); // why: ensure first focus on real user fix
-  const [followMe, setFollowMe] = useState(true); // follow user at startup
-  const [userCoord, setUserCoord] = useState<[number, number] | null>(null);
+  const lastUserCoordRef = useRef<[number, number] | null>(null);
 
-  // Camera ref (why: we control camera imperatively only after map is ready)
-  const cameraRef = useRef<Camera | null>(null);
+  // Camera ref (keep it wide to avoid SDK type friction)
+  const cameraRef = useRef<any>(null);
 
-  const uniqueId = () => `${Date.now()}-${Math.round(Math.random() * 1e6)}`;
-
-  // Get user location
   const getUserLocation = async () => {
     try {
       const { status } = await Location.requestForegroundPermissionsAsync();
@@ -83,7 +75,6 @@ export default function Map() {
       });
       const { longitude, latitude } = userLocation.coords;
       setLocation([longitude, latitude]);
-      setUserCoord([longitude, latitude]);
     } catch (error) {
       console.error('Error getting user location:', error);
     }
@@ -93,39 +84,65 @@ export default function Map() {
     getUserLocation();
   }, []);
 
-  // Position camera when map is ready + we have a location
-  useEffect(() => {
-    if (!mapReady || !location || !cameraRef.current || didCenter) return;
-    cameraRef.current.setCamera({
-      centerCoordinate: location,
-      zoomLevel: 14,
-      animationMode: 'flyTo',
-      animationDuration: 1000,
-    });
-    setDidCenter(true);
-  }, [mapReady, location, didCenter]);
+  const centerToMe = async () => {
+    let coord = lastUserCoordRef.current || location;
 
-  // open-close Add events
+    if (!coord) {
+      try {
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== 'granted') {
+          console.warn('centerToMe: permission not granted');
+          return;
+        }
+        const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
+        coord = [pos.coords.longitude, pos.coords.latitude];
+        lastUserCoordRef.current = coord;
+        setLocation(coord);
+      } catch (err) {
+        console.warn('centerToMe: failed to fetch GPS', err);
+        return;
+      }
+    }
+
+    if (!mapReady) {
+      console.warn('centerToMe: map not ready yet');
+      return;
+    }
+    if (!cameraRef.current) {
+      console.warn('centerToMe: camera ref missing');
+      return;
+    }
+
+    // Prefer setCamera (atomic); otherwise fly then zoom after a tick
+    if (cameraRef.current.setCamera) {
+      cameraRef.current.setCamera({
+        centerCoordinate: coord,
+        zoomLevel: 14,
+        animationMode: 'flyTo',
+        animationDuration: 800,
+      });
+    } else {
+      cameraRef.current.flyTo?.(coord, 800);
+      requestAnimationFrame(() => cameraRef.current?.zoomTo?.(14, 600));
+    }
+  };
+
   const handleAddEvent = () => setModalVisible(true);
-
-  // Select Event
   const handleSelectEvent = (eventType: EventType) => {
     setSelectedEvent(eventType);
     setModalVisible(false);
   };
 
-  // Add marker
   const handleMapPress = (e: any) => {
     if (!selectedEvent) return;
     const coords = e.geometry.coordinates as [number, number];
     setMarkers((prev) => [
       ...prev,
-      { id: uniqueId(), coordinates: coords, icon: EVENTS[selectedEvent] },
+      { id: Date.now().toString(), coordinates: coords, icon: EVENTS[selectedEvent] },
     ]);
     setSelectedEvent(null);
   };
 
-  // Long press - remove marker
   const handleLongPressMarker = (id: string) => {
     Alert.alert('הסר אירוע', 'האם אתה בטוח שברצונך למחוק אירוע זה?', [
       { text: 'ביטול', style: 'cancel' },
@@ -142,15 +159,13 @@ export default function Map() {
     }
     setLoading(true);
     try {
-      const params = new URLSearchParams({
-        access_token: MAPBOX_TOKEN,
-        types: 'place,locality,region',
-        limit: '7',
-        language: 'he',
-      });
-      const url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(
-        trimmed
-      )}.json?${params.toString()}`;
+      const url =
+        `https://api.mapbox.com/geocoding/v5/mapbox.places/` +
+        `${encodeURIComponent(trimmed)}.json` +
+        `?access_token=${MAPBOX_TOKEN}` +
+        `&types=place,locality,region` +
+        `&limit=7` +
+        `&language=he`;
       const res = await fetch(url);
       const json = await res.json();
       const feats: GeoFeature[] = (json?.features ?? []).map((f: any) => ({
@@ -179,75 +194,46 @@ export default function Map() {
   };
 
   const focusOnFeature = (feature: GeoFeature) => {
-    const [lon, lat] = feature.center;
-    setLocation([lon, lat]);
+    const coord = feature.center as [number, number];
+
+    // UI cleanup
     setOpenList(false);
     setQuery(feature.text);
     Keyboard.dismiss();
 
-    if (cameraRef.current) {
-      cameraRef.current.setCamera({
-        centerCoordinate: [lon, lat],
-        zoomLevel: 11,
-        animationMode: 'flyTo',
-        animationDuration: 1000,
-      });
-    }
-  };
-
-  const centerToMe = async () => {
-    if (!mapReady || !cameraRef.current) return;
-
-    let target = userCoord;
-
-    // If we haven’t received a GPS fix yet, fetch one now
-    if (!target) {
-      try {
-        const { status } = await Location.requestForegroundPermissionsAsync();
-        if (status !== 'granted') return;
-        const last = await Location.getLastKnownPositionAsync();
-        const pos =
-          last ?? (await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High }));
-        target = [pos.coords.longitude, pos.coords.latitude];
-        setUserCoord(target);
-      } catch {
-        return;
-      }
-    }
-
-    // Nudge now and re-enable follow so it tracks the user again
-    setFollowMe(false);
-    cameraRef.current.setCamera({
-      centerCoordinate: target,
-      zoomLevel: 14,
-      animationMode: 'flyTo',
-      animationDuration: 600,
-    });
-    requestAnimationFrame(() => setFollowMe(true));
-  };
-
-  // Mapbox user-location first-focus (why: Mapbox gets GPS slightly earlier than expo sometimes)
-  const handleUserLocationUpdate = (pos: any) => {
-    if (didCenter || !mapReady || !pos?.coords) return;
-    const { longitude, latitude } = pos.coords;
-    if (typeof longitude !== 'number' || typeof latitude !== 'number') return;
-    const coord: [number, number] = [longitude, latitude];
-    setUserCoord(coord);
+    // Keep for your own state if you need it later (not used by Camera anymore)
     setLocation(coord);
-    cameraRef.current?.setCamera({
-      centerCoordinate: coord,
-      zoomLevel: 14,
-      animationMode: 'flyTo',
-      animationDuration: 800,
-    });
-    setDidCenter(true);
+
+    // Move camera atomically, just like centerToMe
+    const move = () => {
+      if (!cameraRef.current) return;
+      if (cameraRef.current.setCamera) {
+        cameraRef.current.setCamera({
+          centerCoordinate: coord,
+          zoomLevel: 11,
+          animationMode: 'flyTo',
+          animationDuration: 900,
+        });
+      } else {
+        cameraRef.current.flyTo?.(coord, 900);
+        requestAnimationFrame(() => cameraRef.current?.zoomTo?.(11, 700));
+      }
+    };
+
+    if (mapReady) {
+      move();
+    } else {
+      // if user searches immediately at startup, wait for style load
+      const id = setTimeout(() => move(), 100);
+      // (optional) clearTimeout on unmount if you add a cleanup
+    }
   };
 
   return (
     <View style={{ flex: 1 }}>
       {/* Search bar + menu */}
-      <View style={styles.searchWrap} pointerEvents="box-none">
-        {/* Round hamburger */}
+      <View style={styles.searchWrap}>
+        {/* Menu */}
         <View>
           <TouchableOpacity style={styles.menuBtn} onPress={() => setMenuOpen((v) => !v)}>
             <Text style={styles.menuIcon}>≡</Text>
@@ -255,28 +241,27 @@ export default function Map() {
 
           {menuOpen && (
             <View style={styles.menuDropdown}>
-              <TouchableOpacity style={styles.menuItem} onPress={centerToMe}>
-                <Text style={styles.menuItemText}>חזרה למיקום שלי</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.menuItem} onPress={() => console.log('clicked')}>
+              <TouchableOpacity style={styles.menuItem} onPress={() => console.log('הגדרות')}>
                 <Text style={styles.menuItemText}>הגדרות</Text>
-                <Image source={require('../assets/icons/setting.png')} />
               </TouchableOpacity>
-              <TouchableOpacity style={styles.menuItem} onPress={() => console.log('clicked')}>
-                <Text style={styles.menuItemText}>היסטוריית התראות</Text>
-                <Image source={require('../assets/icons/history.png')} />
+              <TouchableOpacity
+                style={styles.menuItem}
+                onPress={() => console.log('היסטוריית התרעות')}>
+                <Text style={styles.menuItemText}>היסטוריית התרעות</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={styles.menuItem} onPress={() => console.log('clicked')}>
+              <TouchableOpacity style={styles.menuItem} onPress={() => console.log('צרו עמנו קשר')}>
                 <Text style={styles.menuItemText}>צרו עמנו קשר</Text>
-                <Image source={require('../assets/icons/Contact.png')} />
               </TouchableOpacity>
-              <TouchableOpacity style={styles.menuItem} onPress={() => console.log('clicked')}>
-                <Text style={styles.menuItemText}>אודות היישומון</Text>
-                <Image source={require('../assets/icons/info.png')} />
+              <TouchableOpacity
+                style={styles.menuItem}
+                onPress={() => console.log('אודות היישומון')}>
+                <Text style={styles.menuItemText}>אודות היישמון</Text>
               </TouchableOpacity>
             </View>
           )}
         </View>
+
+        {/* Search */}
         <View style={styles.inputBox}>
           {loading ? <ActivityIndicator style={styles.searchSpinner} /> : null}
 
@@ -307,9 +292,7 @@ export default function Map() {
                   </TouchableOpacity>
                 )}
                 ListEmptyComponent={
-                  loading ? null : (
-                    <Text style={styles.emptyText}>לא נמצאו תוצאות, נסה מחרוזת אחרת</Text>
-                  )
+                  loading ? null : <Text style={styles.emptyText}>לא נמצאו תוצאות</Text>
                 }
               />
             </View>
@@ -322,47 +305,59 @@ export default function Map() {
         styleURL="mapbox://styles/erangr90/cmdeeuopg003g01qy73xgavkp"
         localizeLabels
         onPress={handleMapPress}
-        onTouchStart={() => {
-          setOpenList(false);
-          setFollowMe(false); // user interacted -> stop auto-follow
-        }}
-        onDidFinishRenderingMapFully={() => setMapReady(true)}>
-        {/* Follow user initially; still keep ref for later setCamera calls */}
-        <Camera
-          ref={cameraRef as any}
-          followUserLocation={followMe}
-          followUserMode={Mapbox.UserTrackingMode.Follow}
-          followZoomLevel={14}
-        />
+        onTouchStart={() => setOpenList(false)}
+        onDidFinishLoadingStyle={() => setMapReady(true)}>
+        {location && (
+          <Camera
+            ref={cameraRef}
+            defaultSettings={{ centerCoordinate: location, zoomLevel: 14 }} // ✅ initial only
+            animationMode="flyTo"
+            animationDuration={1000}
+          />
+        )}
 
+        {/* Show user's current location (blue puck) */}
         <UserLocation
           visible
           androidRenderMode="compass"
           showsUserHeadingIndicator
-          onUpdate={handleUserLocationUpdate}
+          onUpdate={(loc) => {
+            // Keep the most recent GPS point in a ref (no re-render)
+            if (loc?.coords) {
+              lastUserCoordRef.current = [loc.coords.longitude, loc.coords.latitude];
+            }
+          }}
         />
 
-        {mapReady &&
-          markers.map((marker) => (
-            <MarkerView key={marker.id} coordinate={marker.coordinates} allowOverlap>
-              {/* why: collapsable=false ensures Android keeps this View for native tag lookup */}
-              <View collapsable={false}>
-                <TouchableOpacity onLongPress={() => handleLongPressMarker(marker.id)}>
-                  <Text style={{ fontSize: 24 }}>{marker.icon}</Text>
-                </TouchableOpacity>
-              </View>
-            </MarkerView>
-          ))}
+        {markers.map((marker) => (
+          <MarkerView key={marker.id} id={marker.id} coordinate={marker.coordinates}>
+            <TouchableOpacity onLongPress={() => handleLongPressMarker(marker.id)}>
+              <Text style={{ fontSize: 24 }}>{marker.icon}</Text>
+            </TouchableOpacity>
+          </MarkerView>
+        ))}
       </MapView>
 
+      {/* Add event */}
       <TouchableOpacity style={styles.button} onPress={handleAddEvent}>
         <Text style={styles.buttonText}>➕</Text>
       </TouchableOpacity>
 
-      <TouchableOpacity style={styles.stress_button} onPress={() => console.log('Click')}>
+      {/* Optional: quick recenter button */}
+      <TouchableOpacity
+        style={styles.gpsBtn}
+        onPress={() => {
+          centerToMe();
+        }}>
+        <Text style={styles.buttonText}>📍</Text>
+      </TouchableOpacity>
+
+      {/* Stress button (kept from your version) */}
+      <TouchableOpacity style={styles.stress_button} onPress={handleAddEvent}>
         <Text style={styles.buttonText}>❕</Text>
       </TouchableOpacity>
 
+      {/* Events modal */}
       <Modal
         visible={modalVisible}
         transparent
@@ -429,8 +424,8 @@ const styles = StyleSheet.create({
   searchInput: {
     height: 44,
     borderRadius: 10,
-    paddingLeft: 40,
-    paddingRight: 44,
+    paddingLeft: 40, // room for the icon
+    paddingRight: 44, // room for spinner on the right
     backgroundColor: '#fff',
     ...SHADOW,
   },
@@ -465,6 +460,16 @@ const styles = StyleSheet.create({
     position: 'absolute',
     bottom: 40,
     left: 30,
+    backgroundColor: 'white',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 10,
+    elevation: 3,
+  },
+  gpsBtn: {
+    position: 'absolute',
+    bottom: 40,
+    right: 20,
     backgroundColor: 'white',
     paddingVertical: 10,
     paddingHorizontal: 16,
@@ -509,6 +514,7 @@ const styles = StyleSheet.create({
   modalItemText: { fontSize: 16 },
   modalCancel: { marginTop: 10, paddingVertical: 10 },
   modalCancelText: { fontSize: 16, color: 'red', textAlign: 'center' },
+
   menuBtn: {
     width: 44,
     height: 44,
@@ -530,12 +536,11 @@ const styles = StyleSheet.create({
     backgroundColor: '#fff',
     borderRadius: 12,
     overflow: 'hidden',
-    zIndex: 999,
-    transform: [{ translateX: -130 }],
+    zIndex: 999, // keep it above the search input
+    transform: [{ translateX: -130 }], // shift left so it doesn't get cut
     ...SHADOW,
   },
   menuItem: {
-    flexDirection: 'row',
     paddingVertical: 12,
     paddingHorizontal: 14,
     borderBottomWidth: StyleSheet.hairlineWidth,
