@@ -12,6 +12,7 @@ import {
   Keyboard,
   Platform,
   Image,
+  ImageSourcePropType,
 } from 'react-native';
 import Mapbox, { MapView, Camera, MarkerView, UserLocation } from '@rnmapbox/maps';
 import * as Location from 'expo-location';
@@ -21,21 +22,22 @@ const MAPBOX_TOKEN =
 
 Mapbox.setAccessToken(MAPBOX_TOKEN);
 
-const EVENTS = {
-  שרפה: '🔥',
-  'זריקת אבנים': '🪨',
-  'פיגוע דקירה': '🔪',
-  'בקבוק תעברה': '🧨',
-  מחבל: '🥷🏻',
-  'פיגוע דריסה': '🚗💥',
-} as const;
-
-type EventType = keyof typeof EVENTS;
+const CMENU_SRC: Record<string, ImageSourcePropType> = {
+  'פיגוע דקירה': require('../assets/icons/cEvents/knife.png'),
+  'פיגוע דריסה': require('../assets/icons/cEvents/rollOver.png'),
+  'פיגוע ירי': require('../assets/icons/cEvents/gun.png'),
+  'זריקת אבנים': require('../assets/icons/cEvents/rock.png'),
+  'חפץ חשוד': require('../assets/icons/cEvents/case.png'),
+  'בקבוק תעברה': require('../assets/icons/cEvents/bottle.png'),
+  'טילים\\ כלי טיס': require('../assets/icons/cEvents/rocket.png'),
+  שריפה: require('../assets/icons/cEvents/fire.png'),
+};
+type EventType = keyof typeof CMENU_SRC;
 
 interface Marker {
   id: string;
   coordinates: [number, number];
-  icon: string;
+  icon: ImageSourcePropType;
 }
 
 interface GeoFeature {
@@ -152,7 +154,7 @@ export default function Map() {
     // Add marker at user's coordinate
     setMarkers((prev) => [
       ...prev,
-      { id: Date.now().toString(), coordinates: coord!, icon: EVENTS[eventType] },
+      { id: Date.now().toString(), coordinates: coord!, icon: CMENU_SRC[eventType] },
     ]);
 
     // Optionally recentre camera to the dropped marker
@@ -378,7 +380,10 @@ export default function Map() {
         {markers.map((marker) => (
           <MarkerView key={marker.id} id={marker.id} coordinate={marker.coordinates}>
             <TouchableOpacity onLongPress={() => handleLongPressMarker(marker.id)}>
-              <Text style={{ fontSize: 24 }}>{marker.icon}</Text>
+              <Image
+                source={marker.icon}
+                style={{ width: 28, height: 28, resizeMode: 'contain' }}
+              />
             </TouchableOpacity>
           </MarkerView>
         ))}
@@ -412,14 +417,13 @@ export default function Map() {
         <View style={styles.modalOverlay}>
           <View style={styles.modalContainer}>
             <Text style={styles.modalTitle}>בחר אירוע</Text>
-            {Object.entries(EVENTS).map(([key, icon]) => (
+            {Object.entries(CMENU_SRC).map(([key, src]) => (
               <TouchableOpacity
                 key={key}
-                style={styles.modalItem}
+                style={styles.modalItemRow}
                 onPress={() => handleSelectEvent(key as EventType)}>
-                <Text style={styles.modalItemText}>
-                  {key} {icon}
-                </Text>
+                <Text style={styles.modalItemText}>{key}</Text>
+                <Image source={src} style={styles.modalItemIcon} />
               </TouchableOpacity>
             ))}
             <TouchableOpacity style={styles.modalCancel} onPress={() => setModalVisible(false)}>
@@ -601,6 +605,20 @@ const styles = StyleSheet.create({
   menuItemIcon: {
     width: 20,
     height: 20,
+    resizeMode: 'contain',
+    marginLeft: 8,
+  },
+  modalItemRow: {
+    flexDirection: 'row', // row layout
+    justifyContent: 'space-between', // text on left, image on right
+    alignItems: 'center',
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#ddd',
+  },
+  modalItemIcon: {
+    width: 22,
+    height: 22,
     resizeMode: 'contain',
     marginLeft: 8,
   },
