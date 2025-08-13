@@ -128,19 +128,50 @@ export default function Map() {
   };
 
   const handleAddEvent = () => setModalVisible(true);
-  const handleSelectEvent = (eventType: EventType) => {
-    setSelectedEvent(eventType);
-    setModalVisible(false);
-  };
+  const handleSelectEvent = async (eventType: EventType) => {
+    // Prefer the live coordinate from <UserLocation />, else fall back to last known / fresh fetch
+    let coord = lastUserCoordRef.current || location;
 
-  const handleMapPress = (e: any) => {
-    if (!selectedEvent) return;
-    const coords = e.geometry.coordinates as [number, number];
+    if (!coord) {
+      try {
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== 'granted') {
+          Alert.alert('שגיאה', 'אין הרשאת מיקום');
+          return;
+        }
+        const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
+        coord = [pos.coords.longitude, pos.coords.latitude];
+        lastUserCoordRef.current = coord;
+        setLocation(coord);
+      } catch (e) {
+        Alert.alert('שגיאה', 'לא ניתן לקבל מיקום נוכחי');
+        return;
+      }
+    }
+
+    // Add marker at user's coordinate
     setMarkers((prev) => [
       ...prev,
-      { id: Date.now().toString(), coordinates: coords, icon: EVENTS[selectedEvent] },
+      { id: Date.now().toString(), coordinates: coord!, icon: EVENTS[eventType] },
     ]);
+
+    // Optionally recentre camera to the dropped marker
+    if (mapReady && cameraRef.current) {
+      if (cameraRef.current.setCamera) {
+        cameraRef.current.setCamera({
+          centerCoordinate: coord!,
+          zoomLevel: 15,
+          animationMode: 'flyTo',
+          animationDuration: 700,
+        });
+      } else {
+        cameraRef.current.flyTo?.(coord!, 700);
+        requestAnimationFrame(() => cameraRef.current?.zoomTo?.(15, 500));
+      }
+    }
+
     setSelectedEvent(null);
+    setModalVisible(false);
   };
 
   const handleLongPressMarker = (id: string) => {
@@ -243,19 +274,35 @@ export default function Map() {
             <View style={styles.menuDropdown}>
               <TouchableOpacity style={styles.menuItem} onPress={() => console.log('הגדרות')}>
                 <Text style={styles.menuItemText}>הגדרות</Text>
+                <Image
+                  source={require('../assets/icons/menu/setting.png')}
+                  style={styles.menuItemIcon}
+                />
               </TouchableOpacity>
               <TouchableOpacity
                 style={styles.menuItem}
                 onPress={() => console.log('היסטוריית התרעות')}>
                 <Text style={styles.menuItemText}>היסטוריית התרעות</Text>
+                <Image
+                  source={require('../assets/icons/menu/history.png')}
+                  style={styles.menuItemIcon}
+                />
               </TouchableOpacity>
               <TouchableOpacity style={styles.menuItem} onPress={() => console.log('צרו עמנו קשר')}>
                 <Text style={styles.menuItemText}>צרו עמנו קשר</Text>
+                <Image
+                  source={require('../assets/icons/menu/contact.png')}
+                  style={styles.menuItemIcon}
+                />
               </TouchableOpacity>
               <TouchableOpacity
                 style={styles.menuItem}
                 onPress={() => console.log('אודות היישומון')}>
                 <Text style={styles.menuItemText}>אודות היישמון</Text>
+                <Image
+                  source={require('../assets/icons/menu/info.png')}
+                  style={styles.menuItemIcon}
+                />
               </TouchableOpacity>
             </View>
           )}
@@ -304,7 +351,6 @@ export default function Map() {
         style={{ flex: 1 }}
         styleURL="mapbox://styles/erangr90/cmdeeuopg003g01qy73xgavkp"
         localizeLabels
-        onPress={handleMapPress}
         onTouchStart={() => setOpenList(false)}
         onDidFinishLoadingStyle={() => setMapReady(true)}>
         {location && (
@@ -353,7 +399,7 @@ export default function Map() {
       </TouchableOpacity>
 
       {/* Stress button (kept from your version) */}
-      <TouchableOpacity style={styles.stress_button} onPress={handleAddEvent}>
+      <TouchableOpacity style={styles.stress_button} onPress={() => console.log('save me button')}>
         <Text style={styles.buttonText}>❕</Text>
       </TouchableOpacity>
 
@@ -541,6 +587,9 @@ const styles = StyleSheet.create({
     ...SHADOW,
   },
   menuItem: {
+    flexDirection: 'row', // put text and image in a row
+    justifyContent: 'space-between', // push them apart
+    alignItems: 'center', // vertical centering
     paddingVertical: 12,
     paddingHorizontal: 14,
     borderBottomWidth: StyleSheet.hairlineWidth,
@@ -548,5 +597,11 @@ const styles = StyleSheet.create({
   },
   menuItemText: {
     fontSize: 15,
+  },
+  menuItemIcon: {
+    width: 20,
+    height: 20,
+    resizeMode: 'contain',
+    marginLeft: 8,
   },
 });
