@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import {
   View,
   StyleSheet,
@@ -17,10 +17,24 @@ import {
 import Mapbox, { MapView, Camera, MarkerView, UserLocation } from '@rnmapbox/maps';
 import * as Location from 'expo-location';
 
+/**
+ * Map screen with:
+ * - Search (Mapbox Geocoding)
+ * - User location centering
+ * - Event markers (icon + background ring)
+ *
+ * "Why" comments highlight intent behind non-obvious choices.
+ */
+
+// ────────────────────────────────────────────────────────────────────────────────
+// Config & constants
+// ────────────────────────────────────────────────────────────────────────────────
 const MAPBOX_TOKEN =
   'pk.eyJ1IjoiZXJhbmdyOTAiLCJhIjoiY21kYmJpdTNoMDRyZTJxczIyYTU3NHFxNiJ9.VjCGEFeXxnYsuZ8eHARFZw';
 
 Mapbox.setAccessToken(MAPBOX_TOKEN);
+
+const STYLE_URL = 'mapbox://styles/erangr90/cmdeeuopg003g01qy73xgavkp';
 
 const CMENU_SRC: Record<string, ImageSourcePropType> = {
   'פיגוע דקירה': require('../assets/icons/cEvents/knife.png'),
@@ -35,7 +49,7 @@ const CMENU_SRC: Record<string, ImageSourcePropType> = {
 
 type EventType = keyof typeof CMENU_SRC;
 
-// ✅ Use the marker icon set for map pins (same keys as CMENU_SRC)
+// [event icon, radio ring]
 const marks: Record<EventType, [ImageSourcePropType, ImageSourcePropType]> = {
   'פיגוע דקירה': [
     require('../assets/icons/marks/knife.png'),
@@ -68,7 +82,7 @@ const marks: Record<EventType, [ImageSourcePropType, ImageSourcePropType]> = {
   שריפה: [require('../assets/icons/marks/fire.png'), require('../assets/icons/radios/big.png')],
 };
 
-interface Marker {
+interface MarkerModel {
   id: string;
   coordinates: [number, number];
   icons: [ImageSourcePropType, ImageSourcePropType];
@@ -82,14 +96,25 @@ interface GeoFeature {
 }
 
 const COUNTRY = 'il'; // Israel
-// [minLon, minLat, maxLon, maxLat] — a slightly generous box around Israel
+// [minLon, minLat, maxLon, maxLat]
 const ISRAEL_BBOX: [number, number, number, number] = [34.2, 29.3, 35.95, 33.6];
 
+// ────────────────────────────────────────────────────────────────────────────────
+// Component
+// ────────────────────────────────────────────────────────────────────────────────
 export default function Map() {
+  // Location & map
   const [location, setLocation] = useState<[number, number] | null>(null);
-  const [selectedEvent, setSelectedEvent] = useState<EventType | null>(null);
-  const [markers, setMarkers] = useState<Marker[]>([]);
+  const [mapReady, setMapReady] = useState(false);
+  const lastUserCoordRef = useRef<[number, number] | null>(null);
+  const cameraRef = useRef<any>(null); // SDK types vary per version
+
+  // UI state
+  const [menuOpen, setMenuOpen] = useState(false);
   const [modalVisible, setModalVisible] = useState(false);
+
+  // Markers
+  const [markers, setMarkers] = useState<MarkerModel[]>([]);
 
   // Search state
   const [query, setQuery] = useState('');
@@ -98,128 +123,89 @@ export default function Map() {
   const [openList, setOpenList] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const [menuOpen, setMenuOpen] = useState(false);
+  // ────────────────────────────────────────────────────────────────────────────
+  // Helpers
+  // ────────────────────────────────────────────────────────────────────────────
 
-  const [mapReady, setMapReady] = useState(false);
-  const lastUserCoordRef = useRef<[number, number] | null>(null);
-
-  // Camera ref (keep it wide to avoid SDK type friction)
-  const cameraRef = useRef<any>(null);
-
-  const getUserLocation = async () => {
+  /** Get a usable coordinate.
+   *  Why: centralize permission/accuracy flow to avoid repetition/bugs.
+   */
+  const ensureCoordinate = useCallback(async (): Promise<[number, number] | null> => {
+    const existing = lastUserCoordRef.current || location;
+    if (existing) return existing;
     try {
       const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') return;
-      const userLocation = await Location.getCurrentPositionAsync({
-        accuracy: Location.Accuracy.High,
-      });
-      const { longitude, latitude } = userLocation.coords;
-      setLocation([longitude, latitude]);
-    } catch (error) {
-      console.error('Error getting user location:', error);
+      if (status !== 'granted') return null;
+      const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
+      const coord: [number, number] = [pos.coords.longitude, pos.coords.latitude];
+      lastUserCoordRef.current = coord;
+      setLocation(coord);
+      return coord;
+    } catch (e) {
+      return null;
     }
-  };
+  }, [location]);
 
-  useEffect(() => {
-    getUserLocation();
-  }, []);
-
-  const centerToMe = async () => {
-    let coord = lastUserCoordRef.current || location;
-
-    if (!coord) {
-      try {
-        const { status } = await Location.requestForegroundPermissionsAsync();
-        if (status !== 'granted') {
-          console.warn('centerToMe: permission not granted');
-          return;
-        }
-        const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
-        coord = [pos.coords.longitude, pos.coords.latitude];
-        lastUserCoordRef.current = coord;
-        setLocation(coord);
-      } catch (err) {
-        console.warn('centerToMe: failed to fetch GPS', err);
-        return;
-      }
-    }
-
-    if (!mapReady) {
-      console.warn('centerToMe: map not ready yet');
-      return;
-    }
-    if (!cameraRef.current) {
-      console.warn('centerToMe: camera ref missing');
-      return;
-    }
-
-    // Prefer setCamera (atomic); otherwise fly then zoom after a tick
+  /** Move camera atomically if possible. */
+  const moveCamera = useCallback((center: [number, number], zoom: number, duration = 800) => {
+    if (!cameraRef.current) return;
     if (cameraRef.current.setCamera) {
       cameraRef.current.setCamera({
-        centerCoordinate: coord,
-        zoomLevel: 14,
+        centerCoordinate: center,
+        zoomLevel: zoom,
         animationMode: 'flyTo',
-        animationDuration: 800,
+        animationDuration: duration,
       });
     } else {
-      cameraRef.current.flyTo?.(coord, 800);
-      requestAnimationFrame(() => cameraRef.current?.zoomTo?.(14, 600));
+      cameraRef.current.flyTo?.(center, duration);
+      requestAnimationFrame(() => cameraRef.current?.zoomTo?.(zoom, Math.max(400, duration - 200)));
     }
-  };
+  }, []);
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Effects
+  // ────────────────────────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    // Prefetch a starting location.
+    (async () => {
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== 'granted') return;
+      try {
+        const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
+        setLocation([pos.coords.longitude, pos.coords.latitude]);
+      } catch {}
+    })();
+  }, []);
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Handlers
+  // ────────────────────────────────────────────────────────────────────────────
+
+  const centerToMe = useCallback(async () => {
+    const coord = await ensureCoordinate();
+    if (!coord) return Alert.alert('שגיאה', 'אין הרשאת מיקום');
+    if (!mapReady) return; // Why: avoid calling camera before style load
+    moveCamera(coord, 14, 800);
+  }, [ensureCoordinate, mapReady, moveCamera]);
 
   const handleAddEvent = () => setModalVisible(true);
 
-  // ✅ Always render the map marker using the `marks` icon set (fallback to CMENU_SRC if missing)
-  const getMarkerIcon = (event: EventType): ImageSourcePropType =>
-    marks[event][0] ?? CMENU_SRC[event];
+  const handleSelectEvent = useCallback(
+    async (eventType: EventType) => {
+      const coord = await ensureCoordinate();
+      if (!coord) return Alert.alert('שגיאה', 'לא ניתן לקבל מיקום נוכחי');
 
-  const handleSelectEvent = async (eventType: EventType) => {
-    // Prefer the live coordinate from <UserLocation />, else fall back to last known / fresh fetch
-    let coord = lastUserCoordRef.current || location;
+      setMarkers((prev) => [
+        ...prev,
+        { id: Date.now().toString(), coordinates: coord, icons: marks[eventType] },
+      ]);
 
-    if (!coord) {
-      try {
-        const { status } = await Location.requestForegroundPermissionsAsync();
-        if (status !== 'granted') {
-          Alert.alert('שגיאה', 'אין הרשאת מיקום');
-          return;
-        }
-        const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
-        coord = [pos.coords.longitude, pos.coords.latitude];
-        lastUserCoordRef.current = coord;
-        setLocation(coord);
-      } catch (e) {
-        Alert.alert('שגיאה', 'לא ניתן לקבל מיקום נוכחי');
-        return;
-      }
-    }
-
-    const icon = getMarkerIcon(eventType); // ⚠️ why: use dedicated map pin artwork
-
-    // Add marker at user's coordinate
-    setMarkers((prev) => [
-      ...prev,
-      { id: Date.now().toString(), coordinates: coord!, icons: marks[eventType] },
-    ]);
-
-    // Optionally recentre camera to the dropped marker
-    if (mapReady && cameraRef.current) {
-      if (cameraRef.current.setCamera) {
-        cameraRef.current.setCamera({
-          centerCoordinate: coord!,
-          zoomLevel: 15,
-          animationMode: 'flyTo',
-          animationDuration: 700,
-        });
-      } else {
-        cameraRef.current.flyTo?.(coord!, 700);
-        requestAnimationFrame(() => cameraRef.current?.zoomTo?.(15, 500));
-      }
-    }
-
-    setSelectedEvent(null);
-    setModalVisible(false);
-  };
+      if (mapReady) moveCamera(coord, 15, 700);
+      setModalVisible(false);
+    },
+    [ensureCoordinate, mapReady, moveCamera]
+  );
 
   const handleLongPressMarker = (id: string) => {
     Alert.alert('הסר אירוע', 'האם אתה בטוח שברצונך למחוק אירוע זה?', [
@@ -228,51 +214,52 @@ export default function Map() {
     ]);
   };
 
-  // --- Search ---
-  const searchCities = async (text: string) => {
-    const trimmed = text.trim();
-    if (!trimmed) {
-      setResults([]);
-      return;
-    }
-    setLoading(true);
-    try {
-      // Use latest coord (if available) to bias results near the user
-      const prox = lastUserCoordRef.current || location; // [lon, lat]
-      const proximity = prox ? `&proximity=${prox[0]},${prox[1]}` : '';
+  // Geocoding search
+  const searchCities = useCallback(
+    async (text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed) {
+        setResults([]);
+        return;
+      }
+      setLoading(true);
+      try {
+        const prox = lastUserCoordRef.current || location; // [lon, lat]
+        const proximity = prox ? `&proximity=${prox[0]},${prox[1]}` : '';
 
-      const url =
-        `https://api.mapbox.com/geocoding/v5/mapbox.places/` +
-        `${encodeURIComponent(trimmed)}.json` +
-        `?access_token=${MAPBOX_TOKEN}` +
-        `&types=place,locality,region` + // cities/towns/regions
-        `&limit=7` +
-        `&language=he` +
-        `&country=${COUNTRY}` + // ✅ restrict to Israel
-        `&bbox=${ISRAEL_BBOX.join(',')}` + // ✅ (optional) further limit to Israel’s bounds
-        proximity; // ✅ (optional) bias near user
+        const url =
+          `https://api.mapbox.com/geocoding/v5/mapbox.places/` +
+          `${encodeURIComponent(trimmed)}.json` +
+          `?access_token=${MAPBOX_TOKEN}` +
+          `&types=place,locality,region` +
+          `&limit=7` +
+          `&language=he` +
+          `&country=${COUNTRY}` +
+          `&bbox=${ISRAEL_BBOX.join(',')}` +
+          proximity;
 
-      const res = await fetch(url);
-      const json = await res.json();
-      const feats: GeoFeature[] = (json?.features ?? []).map((f: any) => ({
-        id: f.id,
-        place_name: f.place_name,
-        text: f.text,
-        center: f.center,
-      }));
-      setResults(feats);
-    } catch (e) {
-      console.error('Geocoding error', e);
-      setResults([]);
-    } finally {
-      setLoading(false);
-    }
-  };
+        const res = await fetch(url);
+        const json = await res.json();
+        const feats: GeoFeature[] = (json?.features ?? []).map((f: any) => ({
+          id: f.id,
+          place_name: f.place_name,
+          text: f.text,
+          center: f.center,
+        }));
+        setResults(feats);
+      } catch (e) {
+        console.error('Geocoding error', e);
+        setResults([]);
+      } finally {
+        setLoading(false);
+      }
+    },
+    [location]
+  );
 
   const onChangeQuery = (text: string) => {
     setQuery(text);
     setOpenList(true);
-
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => {
       searchCities(text);
@@ -281,43 +268,21 @@ export default function Map() {
 
   const focusOnFeature = (feature: GeoFeature) => {
     const coord = feature.center as [number, number];
-
-    // UI cleanup
     setOpenList(false);
     setQuery(feature.text);
     Keyboard.dismiss();
-
-    // Keep for your own state if you need it later (not used by Camera anymore)
     setLocation(coord);
 
-    // Move camera atomically, just like centerToMe
-    const move = () => {
-      if (!cameraRef.current) return;
-      if (cameraRef.current.setCamera) {
-        cameraRef.current.setCamera({
-          centerCoordinate: coord,
-          zoomLevel: 11,
-          animationMode: 'flyTo',
-          animationDuration: 900,
-        });
-      } else {
-        cameraRef.current.flyTo?.(coord, 900);
-        requestAnimationFrame(() => cameraRef.current?.zoomTo?.(11, 700));
-      }
-    };
-
-    if (mapReady) {
-      move();
-    } else {
-      // if user searches immediately at startup, wait for style load
-      const id = setTimeout(() => move(), 100);
-      // (optional) clearTimeout on unmount if you add a cleanup
-    }
+    if (mapReady) moveCamera(coord, 11, 900);
+    else setTimeout(() => moveCamera(coord, 11, 900), 100);
   };
 
+  // ────────────────────────────────────────────────────────────────────────────
+  // Render
+  // ────────────────────────────────────────────────────────────────────────────
   return (
     <View style={{ flex: 1 }}>
-      {/* Search bar + menu */}
+      {/* Top bar: menu + search */}
       <View style={styles.searchWrap}>
         {/* Menu */}
         <View>
@@ -404,26 +369,26 @@ export default function Map() {
 
       <MapView
         style={{ flex: 1 }}
-        styleURL="mapbox://styles/erangr90/cmdeeuopg003g01qy73xgavkp"
+        styleURL={STYLE_URL}
         localizeLabels
         onTouchStart={() => setOpenList(false)}
         onDidFinishLoadingStyle={() => setMapReady(true)}>
         {location && (
           <Camera
             ref={cameraRef}
-            defaultSettings={{ centerCoordinate: location, zoomLevel: 14 }} // ✅ initial only
+            defaultSettings={{ centerCoordinate: location, zoomLevel: 14 }}
             animationMode="flyTo"
             animationDuration={1000}
           />
         )}
 
-        {/* Show user's current location (blue puck) */}
+        {/* Blue puck */}
         <UserLocation
           visible
           androidRenderMode="compass"
           showsUserHeadingIndicator
           onUpdate={(loc) => {
-            // Keep the most recent GPS point in a ref (no re-render)
+            // Why: keep freshest GPS without re-renders; used to bias search & centering.
             if (loc?.coords) {
               lastUserCoordRef.current = [loc.coords.longitude, loc.coords.latitude];
             }
@@ -436,9 +401,7 @@ export default function Map() {
               onLongPress={() => handleLongPressMarker(marker.id)}
               activeOpacity={0.8}>
               <View style={styles.markerWrap}>
-                {/* Background ring */}
                 <Image source={marker.icons[1]} style={styles.markerBg} />
-                {/* Foreground event icon (centered) */}
                 <Image source={marker.icons[0]} style={styles.markerFg} />
               </View>
             </TouchableOpacity>
@@ -451,16 +414,12 @@ export default function Map() {
         <Text style={styles.buttonText}>➕</Text>
       </TouchableOpacity>
 
-      {/* Optional: quick recenter button */}
-      <TouchableOpacity
-        style={styles.gpsBtn}
-        onPress={() => {
-          centerToMe();
-        }}>
+      {/* Recenter */}
+      <TouchableOpacity style={styles.gpsBtn} onPress={centerToMe}>
         <Text style={styles.buttonText}>📍</Text>
       </TouchableOpacity>
 
-      {/* Stress button (kept from your version) */}
+      {/* SOS / Stress */}
       <TouchableOpacity style={styles.stress_button} onPress={() => console.log('save me button')}>
         <Text style={styles.buttonText}>❕</Text>
       </TouchableOpacity>
@@ -486,7 +445,6 @@ export default function Map() {
                   onPress={() => handleSelectEvent(item)}
                   activeOpacity={0.8}>
                   <Image source={CMENU_SRC[item]} style={styles.gridIcon} />
-                  {/* No text — image-only as requested */}
                 </TouchableOpacity>
               )}
             />
@@ -500,6 +458,9 @@ export default function Map() {
   );
 }
 
+// ────────────────────────────────────────────────────────────────────────────────
+// Styles (unused rules removed)
+// ────────────────────────────────────────────────────────────────────────────────
 const SHADOW: any =
   Platform.select({
     ios: {
@@ -538,8 +499,8 @@ const styles = StyleSheet.create({
   searchInput: {
     height: 44,
     borderRadius: 10,
-    paddingLeft: 40, // room for the icon
-    paddingRight: 44, // room for spinner on the right
+    paddingLeft: 40, // leave room for icon
+    paddingRight: 44, // leave room for spinner
     backgroundColor: '#fff',
     ...SHADOW,
   },
@@ -620,12 +581,6 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     textAlign: 'center',
   },
-  modalItem: {
-    paddingVertical: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: '#ddd',
-  },
-  modalItemText: { fontSize: 16 },
   modalCancel: { marginTop: 10, paddingVertical: 10 },
   modalCancelText: { fontSize: 16, color: 'red', textAlign: 'center' },
 
@@ -650,14 +605,14 @@ const styles = StyleSheet.create({
     backgroundColor: '#fff',
     borderRadius: 12,
     overflow: 'hidden',
-    zIndex: 999, // keep it above the search input
+    zIndex: 999, // keep above search input
     transform: [{ translateX: -130 }], // shift left so it doesn't get cut
     ...SHADOW,
   },
   menuItem: {
-    flexDirection: 'row', // put text and image in a row
-    justifyContent: 'space-between', // push them apart
-    alignItems: 'center', // vertical centering
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
     paddingVertical: 12,
     paddingHorizontal: 14,
     borderBottomWidth: StyleSheet.hairlineWidth,
@@ -672,49 +627,33 @@ const styles = StyleSheet.create({
     resizeMode: 'contain',
     marginLeft: 8,
   },
-  modalItemRow: {
-    flexDirection: 'row', // row layout
-    justifyContent: 'space-between', // text on left, image on right
-    alignItems: 'center',
-    paddingVertical: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: '#ddd',
-  },
-  modalItemIcon: {
-    width: 22,
-    height: 22,
-    resizeMode: 'contain',
-    marginLeft: 8,
-  },
-  gridRow: {
-    justifyContent: 'space-between', // nice spacing across the row
-  },
 
+  gridRow: {
+    justifyContent: 'space-between',
+  },
   gridItem: {
-    flex: 1, // let FlatList size columns evenly
+    flex: 1,
     marginVertical: 10,
     marginHorizontal: 8,
     alignItems: 'center',
     justifyContent: 'center',
-    // optional: subtle shadow
   },
-
   gridIcon: {
     width: 60,
     height: 60,
     resizeMode: 'contain',
   },
+
   markerWrap: {
     alignItems: 'center',
     justifyContent: 'center',
   },
   markerBg: {
-    // No forced width/height → renders at natural image size
     resizeMode: 'contain',
   },
   markerFg: {
     position: 'absolute',
-    width: 40, // 🔥 make this larger (adjust as needed)
+    width: 40,
     height: 40,
     resizeMode: 'contain',
   },
