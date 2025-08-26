@@ -32,12 +32,46 @@ const CMENU_SRC: Record<string, ImageSourcePropType> = {
   'טילים\\ כלי טיס': require('../assets/icons/cEvents/rocket.png'),
   שריפה: require('../assets/icons/cEvents/fire.png'),
 };
+
 type EventType = keyof typeof CMENU_SRC;
+
+// ✅ Use the marker icon set for map pins (same keys as CMENU_SRC)
+const marks: Record<EventType, [ImageSourcePropType, ImageSourcePropType]> = {
+  'פיגוע דקירה': [
+    require('../assets/icons/marks/knife.png'),
+    require('../assets/icons/radios/small.png'),
+  ],
+  'פיגוע דריסה': [
+    require('../assets/icons/marks/carHit.png'),
+    require('../assets/icons/radios/mid.png'),
+  ],
+  'פיגוע ירי': [
+    require('../assets/icons/marks/gun.png'),
+    require('../assets/icons/radios/mid.png'),
+  ],
+  'זריקת אבנים': [
+    require('../assets/icons/marks/rock.png'),
+    require('../assets/icons/radios/mid.png'),
+  ],
+  'חפץ חשוד': [
+    require('../assets/icons/marks/case.png'),
+    require('../assets/icons/radios/small.png'),
+  ],
+  'בקבוק תעברה': [
+    require('../assets/icons/marks/molotov.png'),
+    require('../assets/icons/radios/mid.png'),
+  ],
+  'טילים\\ כלי טיס': [
+    require('../assets/icons/marks/missle.png'),
+    require('../assets/icons/radios/big.png'),
+  ],
+  שריפה: [require('../assets/icons/marks/fire.png'), require('../assets/icons/radios/big.png')],
+};
 
 interface Marker {
   id: string;
   coordinates: [number, number];
-  icon: ImageSourcePropType;
+  icons: [ImageSourcePropType, ImageSourcePropType];
 }
 
 interface GeoFeature {
@@ -46,6 +80,10 @@ interface GeoFeature {
   text: string;
   center: [number, number]; // [lon, lat]
 }
+
+const COUNTRY = 'il'; // Israel
+// [minLon, minLat, maxLon, maxLat] — a slightly generous box around Israel
+const ISRAEL_BBOX: [number, number, number, number] = [34.2, 29.3, 35.95, 33.6];
 
 export default function Map() {
   const [location, setLocation] = useState<[number, number] | null>(null);
@@ -130,6 +168,11 @@ export default function Map() {
   };
 
   const handleAddEvent = () => setModalVisible(true);
+
+  // ✅ Always render the map marker using the `marks` icon set (fallback to CMENU_SRC if missing)
+  const getMarkerIcon = (event: EventType): ImageSourcePropType =>
+    marks[event][0] ?? CMENU_SRC[event];
+
   const handleSelectEvent = async (eventType: EventType) => {
     // Prefer the live coordinate from <UserLocation />, else fall back to last known / fresh fetch
     let coord = lastUserCoordRef.current || location;
@@ -151,10 +194,12 @@ export default function Map() {
       }
     }
 
+    const icon = getMarkerIcon(eventType); // ⚠️ why: use dedicated map pin artwork
+
     // Add marker at user's coordinate
     setMarkers((prev) => [
       ...prev,
-      { id: Date.now().toString(), coordinates: coord!, icon: CMENU_SRC[eventType] },
+      { id: Date.now().toString(), coordinates: coord!, icons: marks[eventType] },
     ]);
 
     // Optionally recentre camera to the dropped marker
@@ -192,13 +237,21 @@ export default function Map() {
     }
     setLoading(true);
     try {
+      // Use latest coord (if available) to bias results near the user
+      const prox = lastUserCoordRef.current || location; // [lon, lat]
+      const proximity = prox ? `&proximity=${prox[0]},${prox[1]}` : '';
+
       const url =
         `https://api.mapbox.com/geocoding/v5/mapbox.places/` +
         `${encodeURIComponent(trimmed)}.json` +
         `?access_token=${MAPBOX_TOKEN}` +
-        `&types=place,locality,region` +
+        `&types=place,locality,region` + // cities/towns/regions
         `&limit=7` +
-        `&language=he`;
+        `&language=he` +
+        `&country=${COUNTRY}` + // ✅ restrict to Israel
+        `&bbox=${ISRAEL_BBOX.join(',')}` + // ✅ (optional) further limit to Israel’s bounds
+        proximity; // ✅ (optional) bias near user
+
       const res = await fetch(url);
       const json = await res.json();
       const feats: GeoFeature[] = (json?.features ?? []).map((f: any) => ({
@@ -379,11 +432,15 @@ export default function Map() {
 
         {markers.map((marker) => (
           <MarkerView key={marker.id} id={marker.id} coordinate={marker.coordinates}>
-            <TouchableOpacity onLongPress={() => handleLongPressMarker(marker.id)}>
-              <Image
-                source={marker.icon}
-                style={{ width: 28, height: 28, resizeMode: 'contain' }}
-              />
+            <TouchableOpacity
+              onLongPress={() => handleLongPressMarker(marker.id)}
+              activeOpacity={0.8}>
+              <View style={styles.markerWrap}>
+                {/* Background ring */}
+                <Image source={marker.icons[1]} style={styles.markerBg} />
+                {/* Foreground event icon (centered) */}
+                <Image source={marker.icons[0]} style={styles.markerFg} />
+              </View>
             </TouchableOpacity>
           </MarkerView>
         ))}
@@ -417,15 +474,22 @@ export default function Map() {
         <View style={styles.modalOverlay}>
           <View style={styles.modalContainer}>
             <Text style={styles.modalTitle}>בחר אירוע</Text>
-            {Object.entries(CMENU_SRC).map(([key, src]) => (
-              <TouchableOpacity
-                key={key}
-                style={styles.modalItemRow}
-                onPress={() => handleSelectEvent(key as EventType)}>
-                <Text style={styles.modalItemText}>{key}</Text>
-                <Image source={src} style={styles.modalItemIcon} />
-              </TouchableOpacity>
-            ))}
+            <FlatList
+              data={Object.keys(CMENU_SRC) as EventType[]}
+              numColumns={3}
+              keyExtractor={(k) => k}
+              columnWrapperStyle={styles.gridRow}
+              contentContainerStyle={{ paddingTop: 8 }}
+              renderItem={({ item }) => (
+                <TouchableOpacity
+                  style={styles.gridItem}
+                  onPress={() => handleSelectEvent(item)}
+                  activeOpacity={0.8}>
+                  <Image source={CMENU_SRC[item]} style={styles.gridIcon} />
+                  {/* No text — image-only as requested */}
+                </TouchableOpacity>
+              )}
+            />
             <TouchableOpacity style={styles.modalCancel} onPress={() => setModalVisible(false)}>
               <Text style={styles.modalCancelText}>ביטול</Text>
             </TouchableOpacity>
@@ -621,5 +685,37 @@ const styles = StyleSheet.create({
     height: 22,
     resizeMode: 'contain',
     marginLeft: 8,
+  },
+  gridRow: {
+    justifyContent: 'space-between', // nice spacing across the row
+  },
+
+  gridItem: {
+    flex: 1, // let FlatList size columns evenly
+    marginVertical: 10,
+    marginHorizontal: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    // optional: subtle shadow
+  },
+
+  gridIcon: {
+    width: 60,
+    height: 60,
+    resizeMode: 'contain',
+  },
+  markerWrap: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  markerBg: {
+    // No forced width/height → renders at natural image size
+    resizeMode: 'contain',
+  },
+  markerFg: {
+    position: 'absolute',
+    width: 40, // 🔥 make this larger (adjust as needed)
+    height: 40,
+    resizeMode: 'contain',
   },
 });
