@@ -95,6 +95,23 @@ interface GeoFeature {
   center: [number, number]; // [lon, lat]
 }
 
+interface EventLog {
+  /** same id as the on-map marker so you can correlate/delete if you want */
+  id: string;
+  /** the key from CMENU_SRC (acts as the “id from CMENU_SRC”) */
+  cmenuId: EventType;
+  /** the icon from CMENU_SRC */
+  cmenuIcon: ImageSourcePropType;
+  /** ISO timestamp of when the user marked the event */
+  markedAt: string;
+  /** reverse-geocoded city (if resolved) */
+  city?: string;
+  /** reverse-geocoded street and house number when available */
+  street?: string;
+  /** where it happened */
+  coordinates: [number, number];
+}
+
 const COUNTRY = 'il'; // Israel
 // [minLon, minLat, maxLon, maxLat]
 const ISRAEL_BBOX: [number, number, number, number] = [34.2, 29.3, 35.95, 33.6];
@@ -122,6 +139,8 @@ export default function Map() {
   const [loading, setLoading] = useState(false);
   const [openList, setOpenList] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const [events, setEvents] = useState<EventLog[]>([]);
 
   // ────────────────────────────────────────────────────────────────────────────
   // Helpers
@@ -162,6 +181,63 @@ export default function Map() {
     }
   }, []);
 
+  const reverseGeocode = useCallback(
+    async (coord: [number, number]): Promise<{ city?: string; street?: string }> => {
+      try {
+        const url =
+          `https://api.mapbox.com/geocoding/v5/mapbox.places/` +
+          `${coord[0]},${coord[1]}.json?access_token=${MAPBOX_TOKEN}` +
+          `&language=he&country=${COUNTRY}&limit=6&types=address,place,locality,region`;
+
+        const res = await fetch(url);
+        const json = await res.json();
+        const feats: any[] = json?.features ?? [];
+
+        // Prefer city from 'place' (then 'locality'/'region')
+        const place =
+          feats.find((f) => f.place_type?.includes('place')) ??
+          feats.find((f) => f.place_type?.includes('locality')) ??
+          feats.find((f) => f.place_type?.includes('region'));
+        let city: string | undefined = place?.text;
+
+        // Prefer street from 'address'
+        const addr = feats.find((f) => f.place_type?.includes('address'));
+        let street: string | undefined;
+        if (addr) {
+          const num = addr.address;
+          const name = addr.text;
+          street = num ? `${name} ${num}` : name;
+
+          // If city still missing, try the address context
+          if (!city && Array.isArray(addr.context)) {
+            const c = addr.context.find((c: any) => c.id?.startsWith('place.'));
+            city = c?.text;
+          }
+        }
+
+        return { city, street };
+      } catch {
+        return { city: undefined, street: undefined };
+      }
+    },
+    []
+  );
+
+  // meters → nearby lon/lat (uniform in a disk)
+  const jitterAroundCoord = (base: [number, number], radiusM: number): [number, number] => {
+    const [lon, lat] = base;
+    const r = radiusM * Math.sqrt(Math.random());
+    const theta = Math.random() * 2 * Math.PI;
+
+    const metersPerDegLat = 111_320;
+    const metersPerDegLon = 111_320 * Math.cos((lat * Math.PI) / 180);
+
+    const dLat = (r * Math.sin(theta)) / metersPerDegLat;
+    const dLon = (r * Math.cos(theta)) / metersPerDegLon;
+
+    return [lon + dLon, lat + dLat];
+  };
+
   // ────────────────────────────────────────────────────────────────────────────
   // Effects
   // ────────────────────────────────────────────────────────────────────────────
@@ -177,6 +253,13 @@ export default function Map() {
       } catch {}
     })();
   }, []);
+
+  useEffect(() => {
+    if (mapReady && (location || lastUserCoordRef.current)) {
+      seedFromMarksNearUser(1, 1500);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mapReady]);
 
   // ────────────────────────────────────────────────────────────────────────────
   // Handlers
@@ -196,23 +279,90 @@ export default function Map() {
       const coord = await ensureCoordinate();
       if (!coord) return Alert.alert('שגיאה', 'לא ניתן לקבל מיקום נוכחי');
 
-      setMarkers((prev) => [
-        ...prev,
-        { id: Date.now().toString(), coordinates: coord, icons: marks[eventType] },
-      ]);
+      // Create a single id used both for marker and event-log row
+      const id = Date.now().toString();
+
+      // Add visual marker
+      setMarkers((prev) => [...prev, { id, coordinates: coord, icons: marks[eventType] }]);
+
+      // Reverse geocode for city/street (best-effort)
+      const { city, street } = await reverseGeocode(coord).catch(() => ({}) as any);
+
+      // Add to events history
+      const log: EventLog = {
+        id,
+        cmenuId: eventType, // (2) id from CMENU_SRC (the key)
+        cmenuIcon: CMENU_SRC[eventType], // (1) icon from CMENU_SRC
+        markedAt: new Date().toISOString(), // (3) time
+        city, // (4) city
+        street, // (5) street if any
+        coordinates: coord,
+      };
+      setEvents((prev) => [log, ...prev]); // newest first
 
       if (mapReady) moveCamera(coord, 15, 700);
       setModalVisible(false);
     },
-    [ensureCoordinate, mapReady, moveCamera]
+    [ensureCoordinate, mapReady, moveCamera, reverseGeocode]
   );
 
   const handleLongPressMarker = (id: string) => {
     Alert.alert('הסר אירוע', 'האם אתה בטוח שברצונך למחוק אירוע זה?', [
       { text: 'ביטול', style: 'cancel' },
-      { text: 'כן', onPress: () => setMarkers((prev) => prev.filter((m) => m.id !== id)) },
+      {
+        text: 'כן',
+        onPress: () => {
+          setMarkers((prev) => prev.filter((m) => m.id !== id));
+          setEvents((prev) => prev.filter((e) => e.id !== id));
+        },
+      },
     ]);
   };
+
+  const seedFromMarksNearUser = useCallback(
+    async (perType = 1, radiusMeters = 1500) => {
+      const base = await ensureCoordinate();
+      if (!base) return Alert.alert('שגיאה', 'אין הרשאת מיקום');
+
+      const types = Object.keys(marks) as EventType[];
+
+      // Create map markers immediately for instant visual feedback
+      const newMarkers: MarkerModel[] = [];
+      // Build EventLog rows (with reverse geocode best-effort)
+      const logPromises: Promise<EventLog>[] = [];
+
+      for (const t of types) {
+        for (let i = 0; i < perType; i++) {
+          const id = `${Date.now()}-${t}-${i}`;
+          const coord = jitterAroundCoord(base, radiusMeters);
+
+          // show on map
+          newMarkers.push({ id, coordinates: coord, icons: marks[t] });
+
+          // add to events array
+          logPromises.push(
+            (async () => {
+              const { city, street } = await reverseGeocode(coord).catch(() => ({}) as any);
+              return {
+                id,
+                cmenuId: t, // key from CMENU_SRC (the "id from CMENU_SRC")
+                cmenuIcon: CMENU_SRC[t], // icon from CMENU_SRC
+                markedAt: new Date().toISOString(),
+                city,
+                street,
+                coordinates: coord,
+              } as EventLog;
+            })()
+          );
+        }
+      }
+
+      setMarkers((prev) => [...prev, ...newMarkers]);
+      const logs = await Promise.all(logPromises);
+      setEvents((prev) => [...logs, ...prev]); // prepend newest
+    },
+    [ensureCoordinate, reverseGeocode]
+  );
 
   // Geocoding search
   const searchCities = useCallback(
@@ -650,11 +800,23 @@ const styles = StyleSheet.create({
   },
   markerBg: {
     resizeMode: 'contain',
+    width: 100,
+    height: 100,
   },
   markerFg: {
     position: 'absolute',
     width: 40,
     height: 40,
     resizeMode: 'contain',
+  },
+  seedBtn: {
+    position: 'absolute',
+    bottom: 100, // above the ➕ button
+    left: 30,
+    backgroundColor: 'white',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 10,
+    elevation: 3,
   },
 });
