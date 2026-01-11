@@ -16,6 +16,7 @@ import {
 } from 'react-native';
 import Mapbox, { MapView, Camera, MarkerView, UserLocation } from '@rnmapbox/maps';
 import * as Location from 'expo-location';
+import { I18nManager } from 'react-native';
 
 /**
  * Map screen with:
@@ -29,6 +30,9 @@ import * as Location from 'expo-location';
 // ────────────────────────────────────────────────────────────────────────────────
 // Config & constants
 // ────────────────────────────────────────────────────────────────────────────────
+
+const isRTL = true;
+
 const MAPBOX_TOKEN =
   'pk.eyJ1IjoiZXJhbmdyOTAiLCJhIjoiY21kYmJpdTNoMDRyZTJxczIyYTU3NHFxNiJ9.VjCGEFeXxnYsuZ8eHARFZw';
 
@@ -181,47 +185,111 @@ export default function Map() {
     }
   }, []);
 
-  const reverseGeocode = useCallback(
-    async (coord: [number, number]): Promise<{ city?: string; street?: string }> => {
-      try {
-        const url =
-          `https://api.mapbox.com/geocoding/v5/mapbox.places/` +
-          `${coord[0]},${coord[1]}.json?access_token=${MAPBOX_TOKEN}` +
-          `&language=he&country=${COUNTRY}&limit=6&types=address,place,locality,region`;
+  const reverseGeocode = async (
+    coord: [number, number]
+  ): Promise<{ city?: string; street?: string }> => {
+    try {
+      // 1) Try focused reverse with useful types
+      const base =
+        `https://api.mapbox.com/geocoding/v5/mapbox.places/` +
+        `${coord[0]},${coord[1]}.json?access_token=${MAPBOX_TOKEN}` +
+        `&language=he&limit=10&country=${COUNTRY}`;
 
-        const res = await fetch(url);
-        const json = await res.json();
-        const feats: any[] = json?.features ?? [];
+      // include more types so we have more chances to find city + street
+      const url = `${base}&types=address,street,neighborhood,locality,place,region,district,postcode`;
 
-        // Prefer city from 'place' (then 'locality'/'region')
-        const place =
-          feats.find((f) => f.place_type?.includes('place')) ??
-          feats.find((f) => f.place_type?.includes('locality')) ??
-          feats.find((f) => f.place_type?.includes('region'));
-        let city: string | undefined = place?.text;
+      const res = await fetch(url);
+      const json = await res.json();
+      const feats: any[] = Array.isArray(json?.features) ? json.features : [];
 
-        // Prefer street from 'address'
-        const addr = feats.find((f) => f.place_type?.includes('address'));
-        let street: string | undefined;
-        if (addr) {
-          const num = addr.address;
-          const name = addr.text;
-          street = num ? `${name} ${num}` : name;
+      // Helper: get "text" in Hebrew if present (Mapbox may emit text_he)
+      const getName = (f: any) =>
+        f?.text_he ?? f?.text ?? f?.properties?.name_he ?? f?.properties?.name;
 
-          // If city still missing, try the address context
-          if (!city && Array.isArray(addr.context)) {
-            const c = addr.context.find((c: any) => c.id?.startsWith('place.'));
-            city = c?.text;
+      // Helper: scan a feature (and its context) for a city-like thing
+      const findCity = (f: any): string | undefined => {
+        const all = [f, ...(Array.isArray(f?.context) ? f.context : [])];
+        // prefer place, then locality, then district/region as last resort
+        const byId = (prefix: string) => all.find((c: any) => c?.id?.startsWith(`${prefix}.`));
+        const byType = (type: string) => all.find((c: any) => c?.place_type?.includes(type));
+
+        const candidates =
+          byId('place') ??
+          byType('place') ??
+          byId('locality') ??
+          byType('locality') ??
+          byId('district') ??
+          byType('district') ??
+          byId('region') ??
+          byType('region');
+
+        return candidates ? getName(candidates) : undefined;
+      };
+
+      // STREET: the top feature if it's an address, else a street/road feature
+      const addr = feats.find((f) => f.place_type?.includes('address'));
+      const streetFeat =
+        addr ??
+        feats.find(
+          (f) =>
+            f.place_type?.includes('street') ||
+            f.id?.startsWith('road.') ||
+            f.id?.startsWith('street.')
+        );
+
+      let street: string | undefined;
+      if (addr) {
+        const name = getName(addr);
+        const num = addr?.address;
+        street = name ? (num ? `${name} ${num}` : name) : undefined;
+      } else if (streetFeat) {
+        street = getName(streetFeat);
+      }
+
+      // CITY: try from the most specific candidate (address → context), else other features
+      let city: string | undefined;
+      if (addr) city = findCity(addr);
+      if (!city) {
+        // look through other features until we find a city-like thing
+        for (const f of feats) {
+          city = findCity(f);
+          if (city) break;
+        }
+      }
+
+      // If still nothing, do a very broad fallback (no type filter)
+      if (!city || !street) {
+        const res2 = await fetch(`${base}`);
+        const json2 = await res2.json();
+        const feats2: any[] = Array.isArray(json2?.features) ? json2.features : [];
+        if (!city) {
+          for (const f of feats2) {
+            city = findCity(f);
+            if (city) break;
           }
         }
-
-        return { city, street };
-      } catch {
-        return { city: undefined, street: undefined };
+        if (!street) {
+          const fa =
+            feats2.find((f) => f.place_type?.includes('address')) ??
+            feats2.find((f) => f.place_type?.includes('street'));
+          if (fa) {
+            if (fa.place_type?.includes('address')) {
+              const name = getName(fa);
+              const num = fa?.address;
+              street = name ? (num ? `${name} ${num}` : name) : undefined;
+            } else {
+              street = getName(fa);
+            }
+          }
+        }
       }
-    },
-    []
-  );
+
+      return { city, street };
+    } catch (err) {
+      console.warn('reverseGeocode failed', err);
+      return { city: undefined, street: undefined };
+    }
+  };
 
   // meters → nearby lon/lat (uniform in a disk)
   const jitterAroundCoord = (base: [number, number], radiusM: number): [number, number] => {
@@ -279,31 +347,30 @@ export default function Map() {
       const coord = await ensureCoordinate();
       if (!coord) return Alert.alert('שגיאה', 'לא ניתן לקבל מיקום נוכחי');
 
-      // Create a single id used both for marker and event-log row
       const id = Date.now().toString();
 
-      // Add visual marker
+      // 1. Add marker to the map immediately
       setMarkers((prev) => [...prev, { id, coordinates: coord, icons: marks[eventType] }]);
 
-      // Reverse geocode for city/street (best-effort)
-      const { city, street } = await reverseGeocode(coord).catch(() => ({}) as any);
+      // 2. Reverse-geocode to resolve city + street
+      const { city, street } = await reverseGeocode(coord);
 
-      // Add to events history
+      // 3. Push into events array with resolved names
       const log: EventLog = {
         id,
-        cmenuId: eventType, // (2) id from CMENU_SRC (the key)
-        cmenuIcon: CMENU_SRC[eventType], // (1) icon from CMENU_SRC
-        markedAt: new Date().toISOString(), // (3) time
-        city, // (4) city
-        street, // (5) street if any
+        cmenuId: eventType,
+        cmenuIcon: CMENU_SRC[eventType],
+        markedAt: new Date().toISOString(),
+        city,
+        street,
         coordinates: coord,
       };
-      setEvents((prev) => [log, ...prev]); // newest first
+      setEvents((prev) => [log, ...prev]);
 
       if (mapReady) moveCamera(coord, 15, 700);
       setModalVisible(false);
     },
-    [ensureCoordinate, mapReady, moveCamera, reverseGeocode]
+    [ensureCoordinate, mapReady, moveCamera]
   );
 
   const handleLongPressMarker = (id: string) => {
@@ -430,6 +497,7 @@ export default function Map() {
   // ────────────────────────────────────────────────────────────────────────────
   // Render
   // ────────────────────────────────────────────────────────────────────────────
+  console.log(events[0]);
   return (
     <View style={{ flex: 1 }}>
       {/* Top bar: menu + search */}
@@ -520,7 +588,7 @@ export default function Map() {
       <MapView
         style={{ flex: 1 }}
         styleURL={STYLE_URL}
-        localizeLabels
+        localizeLabels={{ locale: 'he' }}
         onTouchStart={() => setOpenList(false)}
         onDidFinishLoadingStyle={() => setMapReady(true)}>
         {location && (
@@ -550,8 +618,14 @@ export default function Map() {
             <TouchableOpacity
               onLongPress={() => handleLongPressMarker(marker.id)}
               activeOpacity={0.8}>
-              <View style={styles.markerWrap}>
+              {/* <View style={styles.markerWrap}>
                 <Image source={marker.icons[1]} style={styles.markerBg} />
+                <Image source={marker.icons[0]} style={styles.markerFg} />
+              </View> */}
+              <View style={styles.markerWrap}>
+                {/* background ring MUST have fixed size */}
+                <Image source={marker.icons[1]} style={styles.markerBg} />
+                {/* foreground icon MUST have fixed size */}
                 <Image source={marker.icons[0]} style={styles.markerFg} />
               </View>
             </TouchableOpacity>
@@ -609,7 +683,7 @@ export default function Map() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
-// Styles (unused rules removed)
+// Styles
 // ────────────────────────────────────────────────────────────────────────────────
 const SHADOW: any =
   Platform.select({
@@ -795,6 +869,8 @@ const styles = StyleSheet.create({
   },
 
   markerWrap: {
+    width: 100,
+    height: 100,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -802,21 +878,11 @@ const styles = StyleSheet.create({
     resizeMode: 'contain',
     width: 100,
     height: 100,
+    position: 'absolute',
   },
   markerFg: {
-    position: 'absolute',
     width: 40,
     height: 40,
     resizeMode: 'contain',
-  },
-  seedBtn: {
-    position: 'absolute',
-    bottom: 100, // above the ➕ button
-    left: 30,
-    backgroundColor: 'white',
-    paddingVertical: 10,
-    paddingHorizontal: 16,
-    borderRadius: 10,
-    elevation: 3,
   },
 });
